@@ -1,0 +1,373 @@
+---
+title: 'DengAI: Predicting Disease Spread'
+output: 
+    html_document:
+      code_folding: show
+      number_sections: yes
+      toc: yes
+      toc_float: yes
+      theme: united
+---
+
+Our main purpose is to predict the dengue fever case in two cities, San Juan and Iquitos. The dataset is taken from [DengAI competition hosted by DrivenData](https://www.drivendata.org/competitions/44/dengai-predicting-disease-spread/). We will build the prediction model with decision tree. The model will be evaluated using Mean Absolute Error (MAE). 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(zoo)
+library(dplyr)
+library(naniar) #plot missing values
+library(ggcorrplot) #plot correlation value
+library(TSA)
+library(Boruta) #feature selection
+#decision tree
+library(caret)
+library(rpart)
+library(rattle)
+library(rpart.plot)
+library(RColorBrewer)
+```
+
+
+# Import Data
+We will import the features and labels of our dataset.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+dengue_data <- read_csv("F:/UPH/Semester 9/Capstone/capstone2/dataset/dengue_features_train.csv")
+dengue_labels_train <- read_csv("F:/UPH/Semester 9/Capstone/capstone2/dataset/dengue_labels_train.csv")
+dengue_features_test <- read_csv("F:/UPH/Semester 9/Capstone/capstone2/dataset/dengue_features_test.csv")
+submission_format <- read_csv("F:/UPH/Semester 9/Capstone/capstone2/dataset/submission_format.csv")
+```
+
+# Data Pre-processing
+
+## Data Cleaning
+
+```{r}
+gg_miss_var(dengue_data)
+```
+
+We can see that there are missing values in our training data. For column that has more than 25 missing values, we will drop it. Then, we will handle the rest with linear interpolation.
+
+```{r }
+Na_count <- data.frame(colSums(is.na(dengue_data)))
+unnecessary_feature = rownames(Na_count)[Na_count$colSums.is.na.dengue_data..>25]
+
+dengue_data  <- dengue_data[, -which(names(dengue_data) %in% unnecessary_feature)]
+dengue_features_test  <- dengue_features_test[, -which(names(dengue_features_test) %in% unnecessary_feature)]
+
+for(i in 5:length(dengue_data)){
+  dengue_data[,i] <- na.approx(dengue_data[,i])
+}
+```
+
+
+## Mean Values of Data
+
+```{r warning = FALSE}
+aggregated <- aggregate(dengue_data, by=list(city=dengue_data$city), FUN=mean)
+aggregated <- as.data.frame(t(as.matrix(aggregated)))
+colnames(aggregated) <- c("iq","sj")
+knitr::kable(tail(aggregated, -5), "pipe", digits = 2)
+```
+
+The mean values of `precipitation_amt_mm`, `reanalysis_precip_amt_kg_per_m2`, `reanalysis_tdtr_k`, and `station_precip_mm` in `iq` and `sj` city are quite far apart. So, we should divide the data based on its city to get better result.
+
+## Correlation Matrix
+
+```{r}
+#Get the numeric data only
+num_dengue_data = subset(dengue_data, select = -c(city, week_start_date))
+
+ggcorrplot(cor(num_dengue_data),
+           type = "lower",
+           title="Correlations in dengue feature train data")
+
+cormatrix <- cor(num_dengue_data)
+cormatrix[upper.tri(cormatrix)] <- 0
+diag(cormatrix) <- 0
+highCorFeature <- num_dengue_data[,apply(cormatrix,2,function(x) any(x > 0.90))]
+high_correlated_feature <- colnames(highCorFeature)
+high_correlated_feature
+
+
+#Elimination of Redundant features
+dengue_data  <- dengue_data[, -which(names(dengue_data) %in% high_correlated_feature)]
+dengue_features_test  <- dengue_features_test[, -which(names(dengue_features_test) %in% high_correlated_feature)]
+```
+
+From the correlation matrix, we can see that there are pairs that have really high correlation. We will remove feature that has correlation value > 0.90 to decrease data redundancy. 
+
+## Data Normalization
+
+Now, we will check whether our data is normally distributed with normality test. We will apply Shappiro Wilk Test to all features, except `city`, `year`, `weekofyear`, and `week_start_date`. Here is the hypothesis for every feature.
+
+$H_0$ : Data is normally distributed.
+
+$H_1$ : Data is not normally distributed.
+
+
+```{r message=FALSE, warning=FALSE}
+feature <- c()
+p_value <- c()
+
+for(i in 5:dim(dengue_data)[2]){
+  feature <- c(feature, colnames(dengue_data)[i])
+  p_value <- c(p_value, shapiro.test(dengue_data[,i][[1]])$p.value)
+}
+shapiro_test_data <- data.frame(feature, p_value)
+
+knitr::kable(shapiro_test_data, "pipe", digits = 18)
+
+```
+
+We will use $\alpha = 0.05$ as our threshold of significance. Since the p-value of all features shown in the table is lower than 0.05, we can reject null hypothesis and accept alternative hypothesis. The data is not normally distributed so we will transform the data with z-score normalization method. However, before we do the normalization, we should transform the data into the same measure. All data with Kelvin measure will be converted to Celsius. 
+
+```{r}
+#Transform columns with Kelvin temperature to Celsius
+dengue_data[ , grepl("temp_k", names(dengue_data))] = dengue_data[ , grepl("temp_k", names(dengue_data))]-273.15
+
+#rename column names that contain "temp_k" to "temp_c"
+dengue_data = rename_with(dengue_data, ~ gsub("temp_k", "temp_c", .x,))
+
+#Data Normalization
+for(i in 5:length(dengue_data)){
+  temp_mean <- colSums(dengue_data[,i])/count(dengue_data)
+  temp_std <- var(dengue_data[,i])^(0.5)
+  for(j in 1:1456){
+    dengue_data[j,i] <- (dengue_data[j,i] - temp_mean)/temp_std
+  }
+}
+```
+
+## Data Pre-processing for Test Dataset (Submission)
+
+We will do data pre-processing to our test dataset with the same treatment as in our train dataset.
+
+```{r}
+#data imputation
+for(i in 5:length(dengue_features_test)){
+  dengue_features_test[,i] <- na.approx(dengue_features_test[,i])
+}
+
+#convert Kelvin to Celsius
+dengue_features_test[ , grepl("temp_k", names(dengue_features_test))] = dengue_features_test[ , grepl("temp_k", names(dengue_features_test))]-273.15
+dengue_features_test = rename_with(dengue_features_test, ~ gsub("temp_k", "temp_c", .x,))
+
+#data normalization
+for(i in 5:length(dengue_features_test)){
+  temp_mean <- colSums(dengue_features_test[,i])/count(dengue_features_test)
+  temp_std <- var(dengue_features_test[,i])^(0.5)
+  for(j in 1:416){
+    dengue_features_test[j,i] <- (dengue_features_test[j,i] - temp_mean)/temp_std
+  }
+}
+
+dengue_features_test$weekofyear <- factor(dengue_features_test$weekofyear)
+```
+
+# Feature Selection
+
+We will do feature selection to know which feature that is important and not important for our prediction model using Boruta model. The  `weekofyear` data also will be converted to categorical variable.
+
+```{r warning=FALSE}
+dengue_data$weekofyear <- factor(dengue_data$weekofyear)
+
+dengue_data <- cbind(dengue_data,dengue_labels_train[,4])
+
+boruta_output<-Boruta(total_cases ~ ., data=dengue_data, doTrace=0, ntree=100)
+boruta_output
+boruta_signif <- getSelectedAttributes(boruta_output, withTentative = TRUE)
+roughFixMod <- TentativeRoughFix(boruta_output)
+boruta_signif <- getSelectedAttributes(roughFixMod)
+
+imps <- attStats(roughFixMod)
+imps2 = imps[imps$decision != 'Rejected', c('meanImp', 'decision')]
+plot(boruta_output, cex.axis=.7, las=2, xlab="", main="Variable Importance")
+
+
+#remove not important feature
+dengue_data <- dengue_data[ , -which(names(dengue_data) %in% c("reanalysis_sat_precip_amt_mm"))]
+dengue_features_test  <- dengue_features_test[ , -which(names(dengue_features_test) %in% c("reanalysis_sat_precip_amt_mm"))]
+```
+
+The result showed that there are 15 important features (denoted with green boxplot) and 1 unimportant feature (denoted with yellow boxplot) in dengue fever cases prediction. The unimportant feature is `reanalysis_sat_precip_amt_mm`, so we will not use it for our modeling.
+
+# Prediction Model with Decision Tree
+
+We will build different model for each city so we will divide the data.
+
+```{r}
+normalized_dengue_sj <- subset(dengue_data, dengue_data$city == "sj")
+normalized_dengue_iq <- subset(dengue_data, dengue_data$city == "iq")
+normalized_test_sj <- subset(dengue_features_test, dengue_features_test$city == "sj")
+normalized_test_iq <- subset(dengue_features_test, dengue_features_test$city == "iq")
+```
+
+
+## Build decision tree model for `sj` city.
+
+We will split our data to train dataset into training data and testing data with proportions of 80% and 20%, respectively. The purpose of this splitting is to build the model with training data and evaluate it with testing data. We will not split it randomly since this is a **timeseries** data.
+
+```{r}
+size = round(dim(normalized_dengue_sj)[1]*0.8)
+train_data_sj <- normalized_dengue_sj[1:size,]
+test_data_sj <- normalized_dengue_sj[(size+1):nrow(normalized_dengue_sj),]
+```
+
+```{r}
+tree_sj <- rpart(total_cases ~ ., data = subset(train_data_sj, select =-c(city,year,week_start_date)), method = "anova")
+tree_sj
+```
+
+Now, we will plot the tree.
+
+```{r}
+fancyRpartPlot(tree_sj)
+```
+
+Here's the model evaluation in predicting the testing data with Mean Absolute Error (MAE) metric. We got MAE of 21.925.
+
+```{r}
+pred_tree_sj <- predict(tree_sj, test_data_sj)
+MAE(as.integer(pred_tree_sj), test_data_sj$total_cases)
+```
+
+We will plot the variable importance in our model.
+
+```{r}
+vImp <- tree_sj$variable.importance
+vImp <- vImp*100/max(vImp)
+ind <- order(vImp)
+vImp = data.frame(vImp)
+names(vImp)[names(vImp)=="vImp"] = "importance"
+ggplot(vImp,
+       aes(x=reorder(rownames(vImp),importance), y=importance)) + 
+  geom_bar(stat = "identity") +
+  coord_flip()
+```
+
+
+From the picture above, we can see that three most important variables are  `ndvi_sw`, `ndvi_se`, and `weekofyear`.
+
+Now, we will prune our tree to increase the model performance. We will choose Complexity Parameter (CP) from the smallest tree that have smallest cross validation error (xerror).
+
+```{r}
+printcp(tree_sj)
+par(mar=c(4,4,3,1))
+plotcp(tree_sj)
+best.cp = tree_sj$cptable[which.min(tree_sj$cptable[,"xerror"]),"CP"]
+print(best.cp)
+```
+
+
+```{r}
+tree2_sj <- prune(tree_sj, cp = best.cp)
+fancyRpartPlot(tree2_sj)
+```
+
+Our pruned model resulted MAE of 21.74332. It performed better than the previous model.
+
+```{r}
+pred_tree_sj <- predict(tree2_sj, test_data_sj)
+MAE(as.integer(pred_tree_sj), test_data_sj$total_cases)
+```
+
+## Build decision tree model for `iq` city.
+
+We will split our data into training data and testing data with proportions of 80% and 20%, respectively. We will not split it randomly since this is a **timeseries** data.
+
+```{r}
+size = round(dim(normalized_dengue_iq)[1]*0.8)
+train_data_iq <- normalized_dengue_iq[1:size,]
+test_data_iq <- normalized_dengue_iq[(size+1):nrow(normalized_dengue_iq),]
+```
+
+Build the decision tree model.
+
+```{r}
+tree_iq <- rpart(total_cases ~ ., data = subset(train_data_iq, select =-c(city, year, week_start_date)), method = "anova")
+tree_iq
+fancyRpartPlot(tree_iq)
+```
+
+We got MAE of 6.817 in predicting test data.
+
+```{r}
+pred_tree_iq <- predict(tree_iq, test_data_iq)
+MAE(as.integer(pred_tree_iq), test_data_iq$total_cases)
+```
+
+Now, we will plot the variable importance in our tree model.
+
+```{r}
+vImp <- tree_iq$variable.importance
+vImp <- vImp*100/max(vImp)
+ind <- order(vImp)
+vImp = data.frame(vImp)
+names(vImp)[names(vImp)=="vImp"] = "importance"
+ggplot(vImp,
+       aes(x=reorder(rownames(vImp),importance), y=importance)) + 
+  geom_bar(stat = "identity") +
+  coord_flip()
+```
+
+
+We will prune our tree by choosing the best CP.
+
+
+```{r}
+printcp(tree_iq)
+par(mar=c(4,4,3,1))
+plotcp(tree_iq)
+best.cp = tree_iq$cptable[which.min(tree_iq$cptable[,"xerror"]),"CP"]
+```
+
+The best CP is 0.115979.
+
+```{r}
+tree2_iq <- prune(tree_iq, cp = best.cp)
+fancyRpartPlot(tree2_iq)
+```
+
+The MAE from the pruned model is 7.269, which higher than the unpruned model. It seems that there is overfitting in our model.
+
+```{r}
+pred_tree_iq <- predict(tree2_iq, test_data_iq)
+MAE(as.integer(pred_tree_iq), test_data_iq$total_cases)
+```
+
+
+# Predict the submission data
+We will try to predict the submission using the combination of our pruned and unpruned model. Then we will submit our prediction to the competition.
+
+```{r}
+#pruned decision tree for sj and unpruned decision tree for iq
+pred_tree_sj <- predict(tree2_sj, normalized_test_sj)
+pred_tree_iq <- predict(tree_iq, normalized_test_iq)
+pred_tree_A <- c(pred_tree_sj, pred_tree_iq)
+
+#decision tree with pruning for both cities.
+pred_tree_sj <- predict(tree2_sj, normalized_test_sj)
+pred_tree_iq <- predict(tree2_iq, normalized_test_iq)
+pred_tree_B <- c(pred_tree_sj, pred_tree_iq)
+
+#decision tree without pruning for both cities.
+pred_tree_sj <- predict(tree_sj, normalized_test_sj)
+pred_tree_iq <- predict(tree_iq, normalized_test_iq)
+pred_tree_C <- c(pred_tree_sj, pred_tree_iq)
+```
+
+
+# Result
+
+From the table below, we can see that the best model is unpruned decision tree. It predicted the data with MAE of 26.1971. We are in 2024th place among 10674 competitors. 
+```{r}
+sj_model <- c("Pruned tree", "Pruned tree", "Unpruned tree")
+iq_model <- c("Unpruned tree", "Pruned tree", "Unpruned tree")
+MAE <- c(26.2260, 26.4159, 26.1971)
+
+result <- data.frame(sj_model, iq_model, MAE)
+
+knitr::kable(result, "pipe", digits = 5)
+```
